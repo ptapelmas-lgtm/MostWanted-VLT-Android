@@ -30,20 +30,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0  # the tags and commits, for the list of changes since the previous release
-        - name: Checkout private build assets
-          uses: actions/checkout@v5
-          with:
-            repository: ptapelmas-lgtm/MostWanted-build-assets
-            token: ${{ secrets.ASSETS_REPO_TOKEN }}
-            path: private-assets
+          fetch-depth: 0
 
-        - name: Prepare encrypted XBE
-          shell: bash
-          run: |
-            test -f private-assets/default.xbe.enc
-            mkdir -p ci
-            cp private-assets/default.xbe.enc ci/default.xbe.enc
+      - name: Checkout private build assets
+        uses: actions/checkout@v5
+        with:
+          repository: ptapelmas-lgtm/MostWanted-build-assets
+          token: ${{ secrets.ASSETS_REPO_TOKEN }}
+          path: private-assets
+
+      - name: Prepare encrypted XBE
+        shell: bash
+        run: |
+          test -f private-assets/default.xbe.enc
+          mkdir -p ci
+          cp private-assets/default.xbe.enc ci/default.xbe.enc
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
