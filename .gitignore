@@ -49,3 +49,6 @@ layout.toml
 
 # Do not publish game-derived build inputs
 /ci/default.xbe.enc
+
+/assets/default.xbe
+/ci/default.xbe.enc
