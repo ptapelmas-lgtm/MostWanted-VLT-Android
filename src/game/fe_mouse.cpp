@@ -1,0 +1,365 @@
+#include "common/menu.h"
+#include "common/pad_binds.h"
+// Most Wanted's menus are FEng packages, and FEng kept the PC's mouse: packages carry mouse regions (FF_MouseObject,
+// MainMenu.fng's five: its arrows, its middle icon and the button prompts) that it tests a pointer against and sends
+// over, press and click messages for (FEngine::UpdateMouseState, 0x158500). The console's FEngine has its mouse off
+// (bMouseActive, FEngine + 1) and its interface's GetMouseInfo is an empty function shared with other empty methods
+// (0x19BC0), so the touch screen is the mouse here: the interface's vtable slot points at a host function instead,
+// and the mouse is on while a package that takes input has regions and a finger is on it or just left it: else the
+// front end runs as the console's, its mouse off.
+// The console's screens left the PC's mouse handling out (ArrayScroller::UpdateMouse is empty); what the packages'
+// own scripts do with a click still works (MainMenu's arrows, a dialog's OK). A tap on the highlighted button, which
+// those screens accept on the pad's A alone, is told to the touch controls to press A (FeTakeAccept).
+#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "common/aspect.h"
+#include "common/fe_mouse.h"
+#include "common/options.h"
+#include "common/translations.h"
+#include "cpu/x86_context.h"
+#include "kernel/kernel.h"
+#include "kernel/memory.h"
+
+namespace dispatch {
+uint32_t HostThunk(X86Func* fn);  // sdk/runtime/cpu/dispatch.cpp
+}
+
+namespace game {
+
+void OptionsMenuTick(X86Context& ctx);  // options_menu.cpp
+
+namespace {
+
+// cFEng's instance; its first field the FEngine
+constexpr uint32_t kFEng = 0x48E94C;
+// FEngine: bMouseActive, the first package, the game's interface
+constexpr uint32_t kMouseActive = 0x1, kFirstPackage = 0xE0, kInterface = 0x108;
+constexpr uint32_t kGetMouseInfoSlot = 0x44;  // FEGameInterface's vtable
+// FEPackage: the next, its controllers, input taken, its current button, its mouse regions
+constexpr uint32_t kNext = 0x4, kControlMask = 0x20, kInputEnabled = 0x28, kCurrentButton = 0x8C, kMouseObjects = 0xB0;
+constexpr int kMaxPackages = 64;
+// FEngTestForIntersection(float x, float y, FEObject*), cdecl: a point of FEng's screen on an object as drawn
+constexpr uint32_t kTestForIntersection = 0x10CF20;
+
+std::atomic<bool> g_menu{false};
+std::atomic<uint32_t> g_package{0};  // the menu's package, game thread
+// the finger, FEng's screen; each touch counts a press, so one shorter than a frame is still seen down
+std::atomic<int32_t> g_x{0}, g_y{0};
+std::atomic<bool> g_down{false};
+bool g_reported_down = false;  // the button as GetMouseInfo gave it this update, game thread
+std::atomic<uint32_t> g_presses{0};
+// presents the mouse stays on after a touch: past the pointer's leaving, so its regions see it go
+constexpr int kMouseFrames = 30;
+std::atomic<int> g_mouse_frames{0};
+// the press came down on this package's highlighted button
+std::atomic<uint32_t> g_accept_package{0}, g_accept_button{0};
+// the menu has no mouse regions and prompts A (a tutorial's "Press A To Continue"): a tap anywhere is its A
+std::atomic<bool> g_tap_anywhere{false};
+constexpr uint32_t kAnywhere = 1;  // g_accept_button for such a tap
+
+uint32_t FEngine() {
+    uint32_t feng = kernel::R32(kFEng);
+    return feng ? kernel::R32(feng) : 0;
+}
+
+uint32_t Bits(float f) {
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return b;
+}
+
+// the press came down on the package's highlighted button, one FEng's mouse does not click itself (a dialog's OK is
+// a mouse region: A as well would accept the next screen too)
+constexpr uint32_t kObjectFlags = 0x1C, kMouseObject = 1u << 17;
+bool OnCurrentButton(X86Context& ctx) {
+    uint32_t p = g_package, button = p ? kernel::R32(p + kCurrentButton) : 0;
+    if (!button || (kernel::R32(button + kObjectFlags) & kMouseObject)) return false;
+    uint32_t saved[] = {ctx.eax, ctx.ecx, ctx.edx, ctx.ebx, ctx.esi, ctx.edi, ctx.ebp};
+    uint32_t hit = kernel::CallGuest(ctx, kTestForIntersection, {Bits(float(g_x)), Bits(float(g_y)), button}) & 0xFF;
+    ctx.eax = saved[0], ctx.ecx = saved[1], ctx.edx = saved[2], ctx.ebx = saved[3], ctx.esi = saved[4];
+    ctx.edi = saved[5], ctx.ebp = saved[6];
+    return hit != 0;
+}
+
+bool KeyboardPackage(uint32_t p);
+uint32_t PickKey(X86Context& ctx, uint32_t p);
+
+// FEngine::Update's GetMouseInfo(FEMouseInfo&), thiscall: x, y, wheel and the buttons, int16 each. A press shows down
+// for two updates at least, for the press and then the click on its release; then the pointer stays a few updates
+// and leaves, so a resting pointer neither keeps an item hovered nor fights the pad
+void GetMouseInfo(X86Context& ctx, uint8_t*) {
+    constexpr int kHoldUpdates = 2, kStayUpdates = 4;
+    constexpr int16_t kAway = -2000;
+    static uint32_t seen = 0;
+    static int hold = 0, stay = 0;
+    uint32_t info = kernel::Args{ctx}[0];
+    uint32_t presses = g_presses;
+    if (presses != seen) {
+        seen = presses;
+        hold = kHoldUpdates;
+        uint32_t p = g_package;
+        if (!g_tap_anywhere) {  // FeTouch took that one
+            if (p && KeyboardPackage(p)) g_accept_button = PickKey(ctx, p);
+            else g_accept_button = OnCurrentButton(ctx) ? kernel::R32(p + kCurrentButton) : 0;
+            g_accept_package = p;
+        }
+    }
+    bool down = g_down || hold > 0;
+    g_reported_down = down;
+    if (hold > 0) hold--;
+    if (down) stay = kStayUpdates;
+    else if (stay > 0) stay--;
+    bool here = down || stay > 0;
+    kernel::W16(info, uint16_t(here ? int16_t(g_x.load()) : kAway));
+    kernel::W16(info + 2, uint16_t(here ? int16_t(g_y.load()) : kAway));
+    kernel::W16(info + 4, 0);
+    kernel::W16(info + 6, down ? 1 : 0);  // FEMouse_Left
+    OptionsMenuTick(ctx);
+    kernel::Return(ctx, 0, 1);
+}
+
+// The menu's button prompts (the bar of "A Accept", "B Back", "Y Defaults"): in its package an image with the pad
+// button's icon and the string after it in its group, the label; hidden ones, or ones in a hidden group, are not up
+constexpr uint32_t kPackageObjects = 0x4C;
+constexpr uint32_t kObjectNext = 0x4, kObjectType = 0x18, kObjectHidden = 1, kImageTexture = 0x24, kStringText = 0x64;
+constexpr uint32_t kGroupCount = 0x60, kGroupObjects = 0x64;
+constexpr uint32_t kTypeImage = 1, kTypeString = 2, kTypeGroup = 5;
+// the prompts' textures, named for the PS2's buttons: A CROSS, B TRIANGLE, X SQUARE, Y CIRCLE, the triggers L1 and R1;
+// the right stick RIGHT_ANALOG
+constexpr uint32_t kPromptTextures[] = {0x02959349, 0x6851AAF5, 0x7A8B6BD0, 0x54A68051, 0x000005BC, 0x00000682};
+constexpr uint32_t kRightStickTexture = 0xFBB0B78E;
+constexpr int kMaxObjects = 600;
+constexpr uint32_t kPackageName = 0xC;
+uint32_t Peek(uint32_t va);
+
+// The game's keyboard (Keyboard.fng, a profile's name): a grid of 15 columns of buttons (flag kButtonObject), the
+// letters' and digits' and under them the cells of Space, Lowercase, Backspace and Done; the dpad moves the package's
+// current button and A presses it. A tap on a key makes it the current button (FEPackage::SetCurrentButton, thiscall,
+// the object and whether to send the highlight messages), then is a tap on the highlighted button, accepted as A
+constexpr uint32_t kButtonObject = 1u << 28;
+constexpr uint32_t kSetCurrentButton = 0x15CB30;
+constexpr int kMaxKeys = 2000;  // the package's objects, both of its pages
+
+// the package's name (Keyboard.fng, Pause_Performance_Tuning.fng) begins with prefix
+bool PackageNamed(uint32_t p, std::string_view prefix) {
+    uint32_t name = Peek(p + kPackageName);
+    for (uint32_t i = 0; i < prefix.size(); i++)
+        if (!name || !mem::IsCommitted(name + i) || char(kernel::G<uint8_t>(name + i)) != prefix[i]) return false;
+    return true;
+}
+bool KeyboardPackage(uint32_t p) { return PackageNamed(p, "Keyboard"); }
+
+// The keys are in groups, which FEngTestForIntersection leaves out (it tests an object's own place, in its group's
+// units): a key is tested as drawn, by its cached render object's (+0x58) transform in the front end's 640x480 (its
+// size at +0x30 and +0x44, its middle at +0x60 and +0x64). That 640x480 is drawn into the middle of FEng's screen by
+// the screen transform (0x0D4888: 0x3D3534 / width across and 0x3D3530 / 480 down; the console's 576 and 448, made
+// 640 and 480 by game.cpp's FullFrameFrontEnd), times the front end's scale at 0x427BFC (the profile's, 1 on the
+// disc's defaults)
+constexpr uint32_t kRenderObject = 0x58;
+constexpr uint32_t kRenderWidth = 0x30, kRenderHeight = 0x44, kRenderX = 0x60, kRenderY = 0x64;
+constexpr uint32_t kSafeWidth = 0x3D3534, kSafeHeight = 0x3D3530;
+constexpr uint32_t kFeScale = 0x427BFC;
+
+float PeekFloat(uint32_t va) {
+    uint32_t b = Peek(va);
+    float f;
+    std::memcpy(&f, &b, 4);
+    return f;
+}
+
+// the shown button under a point of the front end's 640x480, 0 for none; a hidden group's are not shown
+uint32_t KeyAt(float x, float y, uint32_t first, int count, int& budget) {
+    for (uint32_t o = first; o && budget-- > 0 && count != 0; o = Peek(o + kObjectNext), count--) {
+        uint32_t flags = Peek(o + kObjectFlags);
+        if (flags & kObjectHidden) continue;
+        if (Peek(o + kObjectType) == kTypeGroup) {
+            if (uint32_t key = KeyAt(x, y, Peek(o + kGroupObjects), int(Peek(o + kGroupCount)), budget)) return key;
+            continue;
+        }
+        uint32_t r = (flags & kButtonObject) ? Peek(o + kRenderObject) : 0;
+        if (r && std::fabs(x - PeekFloat(r + kRenderX)) * 2 <= std::fabs(PeekFloat(r + kRenderWidth)) &&
+            std::fabs(y - PeekFloat(r + kRenderY)) * 2 <= std::fabs(PeekFloat(r + kRenderHeight)))
+            return o;
+    }
+    return 0;
+}
+
+// the key under the finger made the current button, 0 for none
+uint32_t PickKey(X86Context& ctx, uint32_t p) {
+    int budget = kMaxKeys;
+    // FEng's screen to the front end's 640x480: 480 times the aspect wide with the widescreen flag, else the 640
+    // stretched across the frame (FeTouch)
+    float aspect = Aspect(), across = aspect >= 1.5f ? 1.0f : 480.0f * aspect / 640.0f;
+    float scale = PeekFloat(kFeScale);
+    if (!(scale > 0.1f && scale < 2.0f)) scale = 1.0f;
+    float safe_across = PeekFloat(kSafeWidth) / 640.0f, safe_down = PeekFloat(kSafeHeight) / 480.0f;
+    if (!(safe_across > 0.5f && safe_across <= 1.0f)) safe_across = 1.0f;
+    if (!(safe_down > 0.5f && safe_down <= 1.0f)) safe_down = 1.0f;
+    float x = float(g_x) / (safe_across * across * scale) + 320.0f, y = float(g_y) / (safe_down * scale) + 240.0f;
+    uint32_t key = KeyAt(x, y, Peek(p + kPackageObjects), -1, budget);
+    if (!key || key == kernel::R32(p + kCurrentButton)) return key;
+    uint32_t ecx = ctx.ecx;
+    ctx.ecx = p;
+    kernel::CallGuest(ctx, kSetCurrentButton, {key, 1});
+    ctx.ecx = ecx;
+    return key;
+}
+
+uint32_t Peek(uint32_t va) { return va && mem::IsCommitted(va) && mem::IsCommitted(va + 3) ? kernel::R32(va) : 0; }
+
+// FEng's text, 16 bit characters, in capitals
+std::string Label(uint32_t text) {
+    std::string out;
+    for (uint32_t i = 0; text && i < 24 && mem::IsCommitted(text + i * 2 + 1); i++) {
+        uint16_t c = kernel::G<uint16_t>(text + i * 2);
+        if (!c) break;
+        out += c < 128 ? char(std::toupper(c)) : '?';
+    }
+    return out;
+}
+
+void ScanPrompts(uint32_t first, int count, FePrompts& out, int& budget) {
+    int pending = -1;  // an icon waiting for its label
+    for (uint32_t o = first; o && budget-- > 0 && count != 0; o = Peek(o + kObjectNext), count--) {
+        if (Peek(o + kObjectFlags) & kObjectHidden) continue;
+        uint32_t type = Peek(o + kObjectType);
+        if (type == kTypeGroup) {
+            ScanPrompts(Peek(o + kGroupObjects), int(Peek(o + kGroupCount)), out, budget);
+        } else if (type == kTypeImage) {
+            uint32_t texture = Peek(o + kImageTexture);
+            if (texture == kRightStickTexture) {
+                out.right_stick = true;
+                pending = -1;
+            }
+            for (int i = 0; i < kFePromptCount; i++)
+                if (texture == kPromptTextures[i]) {
+                    out.shown[i] = true;
+                    pending = i;
+                }
+        } else if (type == kTypeString && pending >= 0) {
+            if (out.label[pending].empty()) out.label[pending] = Label(Peek(o + kStringText));
+            pending = -1;
+        }
+    }
+}
+
+std::mutex g_prompts_lock;
+FePrompts g_prompts;  // the menu's, lately
+
+}  // namespace
+
+FePrompts CurrentFePrompts() {
+    std::lock_guard lock(g_prompts_lock);
+    return g_menu ? g_prompts : FePrompts{};
+}
+
+void FeFrame() {
+    uint32_t fe = FEngine();
+    if (!fe) {
+        g_menu = false;
+        input::SetPadMenuMode(true);
+        return;
+    }
+    static const uint32_t thunk = dispatch::HostThunk(GetMouseInfo);
+    if (uint32_t iface = kernel::R32(fe + kInterface)) {
+        uint32_t slot = kernel::R32(iface) + kGetMouseInfoSlot;
+        if (kernel::R32(slot) != thunk) kernel::W32(slot, thunk);
+    }
+    // a package taking input with mouse regions; else one with no regions showing a pad prompt (a tutorial's "Press A
+    // To Continue"), which no tap reaches: a menu still, for the touch controls' ENTER and CLOSE, its mouse off. Not in
+    // a race, where a HUD's prompt would take the pad away
+    uint32_t menu = 0, prompted = 0;
+    bool racing = Racing();
+    FePrompts prompts, found;
+    int n = 0;
+    for (uint32_t p = kernel::R32(fe + kFirstPackage); p && n < kMaxPackages && !menu; p = kernel::R32(p + kNext), n++) {
+        if (!kernel::G<uint8_t>(p + kInputEnabled) || !(kernel::R32(p + kControlMask) & 1)) continue;
+        if (int32_t(kernel::R32(p + kMouseObjects)) > 0) {
+            menu = p;
+        } else if (!prompted && !racing) {
+            int budget = kMaxObjects;
+            ScanPrompts(Peek(p + kPackageObjects), -1, found, budget);
+            if (found.shown[0] || found.shown[1] || found.shown[2] || found.shown[3]) prompted = p;
+            else found = {};
+        }
+    }
+    // cinematic mode hides the pause menu under its camera: no menu then, the touch controls the camera's
+    if (CinematicActive() || ReplayActive()) menu = prompted = 0;
+    int frames = g_mouse_frames;
+    if (g_down) frames = kMouseFrames;
+    else if (frames > 0) frames--;
+    g_mouse_frames = frames;
+    // the keyboard has no mouse regions but its keys are tapped, through GetMouseInfo (PickKey)
+    bool keyboard = !menu && prompted && KeyboardPackage(prompted);
+    kernel::G<uint8_t>(fe + kMouseActive) = (menu != 0 || keyboard) && frames > 0;
+    if (menu) {
+        int budget = kMaxObjects;
+        ScanPrompts(Peek(menu + kPackageObjects), -1, prompts, budget);
+    } else if (prompted) {
+        menu = prompted;
+        prompts = found;
+    }
+    if (menu && KeyboardPackage(menu)) {
+        for (int i = 2; i < kFePromptCount; i++) prompts.shown[i] = false;  // A and B stay, ENTER and CLOSE
+        prompts.right_stick = false;
+    }
+    // the pause menu's PERFORMANCE TUNING: L and R flank the setting's name ("Setting 1") and step through the three
+    // settings. The scan took that name for L's label and found none for R, and its numbers made the touch triggers
+    // the map's zoom; they are the settings' steps
+    if (menu && PackageNamed(menu, "Pause_Performance_Tuning")) {
+        prompts.shown[kFePromptLT] = prompts.shown[kFePromptRT] = true;
+        prompts.label[kFePromptLT] = app::Ui("PREV");
+        prompts.label[kFePromptRT] = app::Ui("NEXT");
+    }
+    g_package = menu;
+    g_menu = menu != 0;
+    input::SetPadMenuMode(menu != 0 || !racing || app::MenuOpen());
+    g_tap_anywhere = menu && menu == prompted && prompts.shown[0];
+    std::lock_guard lock(g_prompts_lock);
+    g_prompts = prompts;
+}
+
+bool FeMenuShown() { return g_menu; }
+bool FeMouseDown() { return g_reported_down; }
+bool FeFinger(float& x, float& y) {
+    x = float(g_x), y = float(g_y);
+    return g_down;
+}
+
+// FEng's mouse may have answered the tap itself (the splash's whole screen region, a dialog's OK): then the screen is
+// on its way out and A as well would act on the one that follows (the splash's A landed on a loading screen and
+// crashed it). The touch controls ask a moment after the tap; the same screen with the same item highlighted and
+// still taking input gets its A
+bool FeTakeAccept() {
+    uint32_t p = g_accept_package.exchange(0), button = g_accept_button.exchange(0);
+    if (!button || p != g_package || !g_menu || !kernel::G<uint8_t>(p + kInputEnabled)) return false;
+    return button == kAnywhere || kernel::R32(p + kCurrentButton) == button;
+}
+
+// FEng's screen has its origin in the middle of the frame (MC_Main_GC.fng's OK, 39 under the middle) and is 480 high.
+// Its hit tests (FEngTestForIntersection) take it as 480 times the frame's aspect wide, in square pixels: with the
+// console's widescreen flag the front end lays out to that width (WidenAspect's), and without it (a frame under 3:2)
+// its 640 wide layout is stretched to the frame and tested so. 640 there put a tap on a row's right arrow 11% short
+// of it on a 3:2 tablet
+void FeTouch(bool down, float u, float v) {
+    float wide = 480.0f * Aspect();
+    g_x = int32_t((u - 0.5f) * wide);
+    g_y = int32_t((v - 0.5f) * 480.0f);
+    if (down && !g_down) {
+        g_presses++;
+        if (g_tap_anywhere) {
+            g_accept_package = g_package.load();
+            g_accept_button = kAnywhere;
+        }
+    }
+    g_down = down;
+    g_mouse_frames = kMouseFrames;
+}
+
+}  // namespace game
